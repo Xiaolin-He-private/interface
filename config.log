@@ -363,7 +363,7 @@ configure:11321: $? = 0
 configure:11379: result: yes
 configure:11383: checking for library containing ncds_apply_rpc2all
 configure:11414: gcc -o conftest  -O3 -Wno-unused-result   conftest.c  >&5
-/tmp/cc2bjE91.o: In function `main':
+/tmp/cc10ZDR2.o: In function `main':
 conftest.c:(.text.startup+0x7): undefined reference to `ncds_apply_rpc2all'
 collect2: error: ld returned 1 exit status
 configure:11414: $? = 1
