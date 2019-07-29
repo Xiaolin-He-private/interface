@@ -5,6 +5,12 @@
  */
 #define _GNU_SOURCE
 
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <dirent.h>
+#include <time.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -45,15 +51,10 @@ NC_EDIT_ERROPT_TYPE erropt = NC_EDIT_ERROPT_NOTSET;
 /* always learnt in the first callback, used by every other */
 static char* iface_name = NULL;
 
-/* flag to indicate interface removal - we stop managing an interface - ignore all other children removals */
-static int iface_ignore = 0;
-
-/* flag to indicate "ipv4" container removal - ignore "enabled" callback */
-static int iface_ipv4enabled_ignore = 0;
 
 /* flag to indicate ipv4-enabled change - we have to reapply the configured addresses -
  * - ignore any changes as they would be applied twice */
-static int iface_ipv4addr_ignore = 0;
+
 
 static int finish(char* msg, int ret, struct nc_err** error) {
 	if (ret != EXIT_SUCCESS && error != NULL) {
@@ -71,227 +72,18 @@ static int finish(char* msg, int ret, struct nc_err** error) {
 	return ret;
 }
 
-int callback_if_interfaces_if_interface_ip_ipv4_ip_mtu(void ** data, XMLDIFF_OP op, xmlNodePtr old_node, xmlNodePtr new_node, struct nc_err** error);
-int callback_if_interfaces_if_interface_ip_ipv6_ip_mtu(void ** data, XMLDIFF_OP op, xmlNodePtr old_node, xmlNodePtr new_node, struct nc_err** error);
-
 xmlNodePtr parse_iface_config(const char* if_name, xmlNsPtr ns, char** msg) {
-	int j;
-	unsigned int ipv4_enabled;
-	xmlNodePtr interface, ip, addr, autoconf, type;
-	xmlNsPtr ipns;
-	char* tmp, *tmp2;
-	struct ip_addrs ips;
 
-	ips.count = 0;
+
+	xmlNodePtr interface;
+
 
 	interface = xmlNewNode(ns, BAD_CAST "interface");
 	xmlNewTextChild(interface, interface->ns, BAD_CAST "name", BAD_CAST if_name);
 
-	/* it hypothetically can be 1 from the file change callback */
-	if (if_name < (char*)2 || (tmp2 = iface_get_type(if_name, msg)) == NULL) {
-		goto fail;
-	}
-	tmp = (char*)xmlBuildQName((xmlChar*)tmp2, BAD_CAST "ianaift", NULL, 0);
-	free(tmp2);
-	type = xmlNewTextChild(interface, interface->ns, BAD_CAST "type", BAD_CAST tmp);
-	xmlNewNs(type, BAD_CAST "urn:ietf:params:xml:ns:yang:iana-if-type", BAD_CAST "ianaift");
-	free(tmp);
-
-	if ((tmp = iface_get_enabled(1, if_name, msg)) == NULL) {
-		goto fail;
-	}
-	xmlNewTextChild(interface, interface->ns, BAD_CAST "enabled", BAD_CAST tmp);
-	free(tmp);
-
-	/* IPv4 */
-	if ((j = iface_get_ipv4_presence(1, if_name, msg)) == -1) {
-		goto fail;
-	}
-	if (j) {
-		ip = xmlNewChild(interface, NULL, BAD_CAST "ipv4", NULL);
-		ipns = xmlNewNs(ip, BAD_CAST "urn:ietf:params:xml:ns:yang:ietf-ip", NULL);
-		xmlSetNs(ip, ipns);
-
-		if ((tmp = iface_get_ipv4_enabled(if_name, msg)) == NULL) {
-			goto fail;
-		}
-		if (strcmp(tmp, "true") == 0) {
-			ipv4_enabled = 1;
-		} else {
-			ipv4_enabled = 0;
-		}
-		xmlNewTextChild(ip, ip->ns, BAD_CAST "enabled", BAD_CAST tmp);
-		free(tmp);
-
-		if ((tmp = iface_get_ipv4_forwarding(1, if_name, msg)) == NULL) {
-			goto fail;
-		}
-		xmlNewTextChild(ip, ip->ns, BAD_CAST "forwarding", BAD_CAST tmp);
-		free(tmp);
-
-		if ((tmp = iface_get_ipv4_mtu(1, if_name, msg)) == NULL) {
-			goto fail;
-		}
-		if (65535 < atoi(tmp)) {
-			/* ietf-ip cannot handle higher MTU, set it to this max */
-			free(iface_name);
-			/* it's just for the callback, we can discard const, no change is taking place */
-			iface_name = (char*)if_name;
-			if (callback_if_interfaces_if_interface_ip_ipv4_ip_mtu(NULL, XMLDIFF_ADD, NULL, xmlNewTextChild(ip, ip->ns, BAD_CAST "mtu", BAD_CAST "65535"), NULL) != EXIT_SUCCESS) {
-				nc_verb_warning("%s: failed to normalize the MTU of %s, real MTU: %s, configuration MTU: 65535", __func__, if_name, tmp);
-			}
-			iface_name = NULL;
-		} else {
-			xmlNewTextChild(ip, ip->ns, BAD_CAST "mtu", BAD_CAST tmp);
-		}
-		free(tmp);
-
-		/* with DHCP enabled, these addresses are not a part of the configuration */
-		if (ipv4_enabled) {
-			if (iface_get_ipv4_ipaddrs(1, if_name, &ips, msg) != 0) {
-				goto fail;
-			}
-			for (j = 0; j < ips.count; ++j) {
-				addr = xmlNewChild(ip, ip->ns, BAD_CAST "address", NULL);
-				xmlNewTextChild(addr, addr->ns, BAD_CAST "ip", BAD_CAST ips.ip[j]);
-				xmlNewTextChild(addr, addr->ns, BAD_CAST "prefix-length", BAD_CAST ips.prefix_or_mac[j]);
-
-				free(ips.ip[j]);
-				free(ips.prefix_or_mac[j]);
-			}
-			if (ips.count != 0) {
-				free(ips.ip);
-				free(ips.prefix_or_mac);
-				ips.count = 0;
-			}
-		}
-
-		if (iface_get_ipv4_neighs(1, if_name, &ips, msg) != 0) {
-			goto fail;
-		}
-		for (j = 0; j < ips.count; ++j) {
-			addr = xmlNewChild(ip, ip->ns, BAD_CAST "neighbor", NULL);
-			xmlNewTextChild(addr, addr->ns, BAD_CAST "ip", BAD_CAST ips.ip[j]);
-			xmlNewTextChild(addr, addr->ns, BAD_CAST "link-layer-address", BAD_CAST ips.prefix_or_mac[j]);
-
-			free(ips.ip[j]);
-			free(ips.prefix_or_mac[j]);
-		}
-		if (ips.count != 0) {
-			free(ips.ip);
-			free(ips.prefix_or_mac);
-			ips.count = 0;
-		}
-	}
-
-	/* IPv6 */
-	if ((j = iface_get_ipv6_presence(1, if_name, msg)) == -1) {
-		goto fail;
-	}
-	if (j) {
-		ip = xmlNewChild(interface, NULL, BAD_CAST "ipv6", NULL);
-		ipns = xmlNewNs(ip, BAD_CAST "urn:ietf:params:xml:ns:yang:ietf-ip", NULL);
-		xmlSetNs(ip, ipns);
-
-		xmlNewTextChild(ip, ip->ns, BAD_CAST "enabled", BAD_CAST "true");
-
-		if ((tmp = iface_get_ipv6_forwarding(1, if_name, msg)) == NULL) {
-			goto fail;
-		}
-		xmlNewTextChild(ip, ip->ns, BAD_CAST "forwarding", BAD_CAST tmp);
-		free(tmp);
-
-		if ((tmp = iface_get_ipv6_mtu(1, if_name, msg)) == NULL) {
-			goto fail;
-		}
-		if (strcmp("65535", tmp) < 0) {
-			/* ietf-ip cannot handle higher MTU, set it to this max */
-			free(iface_name);
-			/* it's just for the callback, we can discard const, no change is taking place */
-			iface_name = (char*)if_name;
-			if (callback_if_interfaces_if_interface_ip_ipv6_ip_mtu(NULL, XMLDIFF_ADD, NULL, xmlNewTextChild(ip, ip->ns, BAD_CAST "mtu", BAD_CAST "65535"), NULL) != EXIT_SUCCESS) {
-				nc_verb_warning("%s: failed to normalize the MTU of %s, real MTU: %s, configuration MTU: 65535", __func__, if_name, tmp);
-			}
-			iface_name = NULL;
-		} else {
-			xmlNewTextChild(ip, ip->ns, BAD_CAST "mtu", BAD_CAST tmp);
-		}
-		free(tmp);
-
-		if (iface_get_ipv6_ipaddrs(1, if_name, &ips, msg) != 0) {
-			goto fail;
-		}
-		for (j = 0; j < ips.count; ++j) {
-			addr = xmlNewChild(ip, ip->ns, BAD_CAST "address", NULL);
-			xmlNewTextChild(addr, addr->ns, BAD_CAST "ip", BAD_CAST ips.ip[j]);
-			xmlNewTextChild(addr, addr->ns, BAD_CAST "prefix-length", BAD_CAST ips.prefix_or_mac[j]);
-
-			free(ips.ip[j]);
-			free(ips.prefix_or_mac[j]);
-
-			/* \todo: add gateway as an extension to the model */
-		}
-		if (ips.count != 0) {
-			free(ips.ip);
-			free(ips.prefix_or_mac);
-			ips.count = 0;
-		}
-
-		if (iface_get_ipv6_neighs(1, if_name, &ips, msg) != 0) {
-			goto fail;
-		}
-		for (j = 0; j < ips.count; ++j) {
-			addr = xmlNewChild(ip, ip->ns, BAD_CAST "neighbor", NULL);
-			xmlNewTextChild(addr, addr->ns, BAD_CAST "ip", BAD_CAST ips.ip[j]);
-			xmlNewTextChild(addr, addr->ns, BAD_CAST "link-layer-address", BAD_CAST ips.prefix_or_mac[j]);
-
-			free(ips.ip[j]);
-			free(ips.prefix_or_mac[j]);
-		}
-		if (ips.count != 0) {
-			free(ips.ip);
-			free(ips.prefix_or_mac);
-		}
-
-		if ((tmp = iface_get_ipv6_dup_addr_det(1, if_name, msg)) == NULL) {
-			goto fail;
-		}
-		xmlNewTextChild(ip, ip->ns, BAD_CAST "dup-addr-detect-transmits", BAD_CAST tmp);
-		free(tmp);
-
-		autoconf = xmlNewChild(ip, ip->ns, BAD_CAST "autoconf", NULL);
-
-		if ((tmp = iface_get_ipv6_creat_glob_addr(1, if_name, msg)) == NULL) {
-			goto fail;
-		}
-		xmlNewTextChild(autoconf, autoconf->ns, BAD_CAST "create-global-addresses", BAD_CAST tmp);
-		free(tmp);
-
-		if ((tmp = iface_get_ipv6_creat_temp_addr(1, if_name, msg)) == NULL) {
-			goto fail;
-		}
-		xmlNewTextChild(autoconf, autoconf->ns, BAD_CAST "create-temporary-addresses", BAD_CAST tmp);
-		free(tmp);
-
-		if ((tmp = iface_get_ipv6_temp_val_lft(1, if_name, msg)) == NULL) {
-			goto fail;
-		}
-		xmlNewTextChild(autoconf, autoconf->ns, BAD_CAST "temporary-valid-lifetime", BAD_CAST tmp);
-		free(tmp);
-
-		if ((tmp = iface_get_ipv6_temp_pref_lft(1, if_name, msg)) == NULL) {
-			goto fail;
-		}
-		xmlNewTextChild(autoconf, autoconf->ns, BAD_CAST "temporary-preferred-lifetime", BAD_CAST tmp);
-		free(tmp);
-	}
 
 	return interface;
 
-fail:
-	xmlFreeNode(interface);
-
-	return NULL;
 }
 
 /**
@@ -311,6 +103,93 @@ fail:
 
  * @return EXIT_SUCCESS or EXIT_FAILURE
  */
+
+char** iface_get_ifcs(unsigned char config, unsigned int* dev_count, char** msg) {
+	DIR* dir;
+	struct dirent* dent;
+	char** ret = NULL;
+#if defined(REDHAT) || defined(SUSE)
+	char* path, *variable, *suffix = NULL;
+	unsigned char normalized;
+#endif
+
+	if ((dir = opendir("/sys/class/net")) == NULL) {
+		asprintf(msg, "%s: failed to open \"/sys/class/net\" (%s).", __func__, strerror(errno));
+		return NULL;
+	}
+
+	while ((dent = readdir(dir))) {
+		if (strcmp(dent->d_name, ".") == 0 || strcmp(dent->d_name, "..") == 0) {
+			continue;
+		}
+
+		/* check if the device is managed by ifup/down scripts */
+		if (config) {
+#if defined(REDHAT) || defined(SUSE)
+			asprintf(&path, "%s/ifcfg-%s", IFCFG_FILES_PATH, dent->d_name);
+			if (access(path, F_OK) == -1 && errno == ENOENT) {
+				free(path);
+				continue;
+			}
+			free(path);
+
+			/* "normalize" the ifcfg file */
+			normalized = 1;
+			if ((value = read_ifcfg_var(dent->d_name, "IPADDR", NULL)) != NULL) {
+				if (remove_ifcfg_var(dent->d_name, "IPADDR", value, NULL) != EXIT_SUCCESS ||
+						write_ifcfg_var(dent->d_name, "IPADDRx", value, &suffix) != EXIT_SUCCESS) {
+					normalized = 0;
+				}
+				free(value);
+
+				if (suffix != NULL && (value = read_ifcfg_var(dent->d_name, "PREFIX", NULL)) != NULL) {
+					asprintf(&variable, "PREFIX%s", suffix);
+					if (remove_ifcfg_var(dent->d_name, "PREFIX", value, NULL) != EXIT_SUCCESS ||
+							write_ifcfg_var(dent->d_name, variable, value, NULL) != EXIT_SUCCESS) {
+						normalized = 0;
+					}
+					free(value);
+					free(variable);
+				}
+
+				if (suffix != NULL && (value = read_ifcfg_var(dent->d_name, "NETMASK", NULL)) != NULL) {
+					asprintf(&variable, "NETMASK%s", suffix);
+					if (remove_ifcfg_var(dent->d_name, "NETMASK", value, NULL) != EXIT_SUCCESS ||
+							write_ifcfg_var(dent->d_name, variable, value, NULL) != EXIT_SUCCESS) {
+						normalized = 0;
+					}
+					free(value);
+					free(variable);
+				}
+				free(suffix);
+				suffix = NULL;
+			}
+
+			if (!normalized) {
+				nc_verb_warning("%s: failed to normalize ifcfg-%s, some configuration problems may occur.", __func__, dent->d_name);
+			}
+#endif
+		}
+
+		/* add a device */
+		if (ret == NULL) {
+			*dev_count = 1;
+			ret = malloc(sizeof(char*));
+		} else {
+			++(*dev_count);
+			ret = realloc(ret, (*dev_count)*sizeof(char*));
+		}
+		ret[*dev_count-1] = strdup(dent->d_name);
+	}
+	closedir(dir);
+
+	if (ret == NULL) {
+		asprintf(msg, "%s: no %snetwork interfaces detected.", __func__, (config ? "managed " : ""));
+	}
+
+	return ret;
+}
+
 int transapi_init(xmlDocPtr * running)
 {
 	int i;
@@ -410,7 +289,6 @@ int transapi_init(xmlDocPtr * running)
 void transapi_close(void)
 {
 	free(iface_name);
-	iface_cleanup();
 }
 
 /**
@@ -423,16 +301,13 @@ void transapi_close(void)
  */
 xmlDocPtr get_state_data (xmlDocPtr model, xmlDocPtr running, struct nc_err **err)
 {
-	int i, j;
+	int i;
 	unsigned int dev_count;
 	xmlDocPtr doc;
-	xmlNodePtr root, interface, ip, addr, stat_node, type;
-	xmlNsPtr ns, ipns;
-	char** devices, *msg = NULL, *tmp, *tmp2;
-	struct device_stats stats;
-	struct ip_addrs ips;
+	xmlNodePtr root, interface;
+	xmlNsPtr ns;
+	char** devices, *msg = NULL;
 
-	ips.count = 0;
 
 	devices = iface_get_ifcs(0, &dev_count, &msg);
 	if (devices == NULL) {
@@ -452,196 +327,6 @@ xmlDocPtr get_state_data (xmlDocPtr model, xmlDocPtr running, struct nc_err **er
 		interface = xmlNewChild(root, root->ns, BAD_CAST "interface", NULL);
 		xmlNewTextChild(interface, interface->ns, BAD_CAST "name", BAD_CAST devices[i]);
 
-		if ((tmp2 = iface_get_type(devices[i], &msg)) == NULL) {
-			goto next_ifc;
-		}
-		tmp = (char*)xmlBuildQName((xmlChar*)tmp2, BAD_CAST "ianaift", NULL, 0);
-		free(tmp2);
-		type = xmlNewTextChild(interface, interface->ns, BAD_CAST "type", BAD_CAST tmp);
-		xmlNewNs(type, BAD_CAST "urn:ietf:params:xml:ns:yang:iana-if-type", BAD_CAST "ianaift");
-		free(tmp);
-
-		if ((tmp = iface_get_operstatus(devices[i], &msg)) == NULL) {
-			goto next_ifc;
-		}
-		xmlNewTextChild(interface, interface->ns, BAD_CAST "oper-status", BAD_CAST tmp);
-		free(tmp);
-
-		if ((tmp = iface_get_lastchange(devices[i], &msg)) == NULL) {
-			goto next_ifc;
-		}
-		xmlNewTextChild(interface, interface->ns, BAD_CAST "last-change", BAD_CAST tmp);
-		free(tmp);
-
-		if ((tmp = iface_get_hwaddr(devices[i], &msg)) == NULL) {
-			goto next_ifc;
-		}
-		xmlNewTextChild(interface, interface->ns, BAD_CAST "phys-address", BAD_CAST tmp);
-		free(tmp);
-
-		if ((tmp = iface_get_speed(devices[i], &msg)) == (char*)-1) {
-			goto next_ifc;
-		}
-		if (tmp != NULL) {
-			xmlNewTextChild(interface, interface->ns, BAD_CAST "speed", BAD_CAST tmp);
-			free(tmp);
-		}
-
-		if (iface_get_stats(devices[i], &stats, &msg) != 0) {
-			goto next_ifc;
-		}
-		stat_node = xmlNewChild(interface, interface->ns, BAD_CAST "statistics", NULL);
-		xmlNewTextChild(stat_node, stat_node->ns, BAD_CAST "discontinuity-time", BAD_CAST stats.reset_time);
-		xmlNewTextChild(stat_node, stat_node->ns, BAD_CAST "in-octets", BAD_CAST stats.in_octets);
-		xmlNewTextChild(stat_node, stat_node->ns, BAD_CAST "in-unicast-pkts", BAD_CAST stats.in_pkts);
-		xmlNewTextChild(stat_node, stat_node->ns, BAD_CAST "in-multicast-pkts", BAD_CAST stats.in_mult_pkts);
-		xmlNewTextChild(stat_node, stat_node->ns, BAD_CAST "in-discards", BAD_CAST stats.in_discards);
-		xmlNewTextChild(stat_node, stat_node->ns, BAD_CAST "in-errors", BAD_CAST stats.in_errors);
-		xmlNewTextChild(stat_node, stat_node->ns, BAD_CAST "out-octets", BAD_CAST stats.out_octets);
-		xmlNewTextChild(stat_node, stat_node->ns, BAD_CAST "out-unicast-pkts", BAD_CAST stats.out_pkts);
-		xmlNewTextChild(stat_node, stat_node->ns, BAD_CAST "out-discards", BAD_CAST stats.out_discards);
-		xmlNewTextChild(stat_node, stat_node->ns, BAD_CAST "out-errors", BAD_CAST stats.out_errors);
-
-		/* IPv4 */
-		if ((j = iface_get_ipv4_presence(0, devices[i], &msg)) == -1) {
-			goto next_ifc;
-		}
-		if (j) {
-			ip = xmlNewChild(interface, NULL, BAD_CAST "ipv4", NULL);
-			ipns = xmlNewNs(ip, BAD_CAST "urn:ietf:params:xml:ns:yang:ietf-ip", NULL);
-			xmlSetNs(ip, ipns);
-
-			if ((tmp = iface_get_ipv4_forwarding(0, devices[i], &msg)) == NULL) {
-				goto next_ifc;
-			}
-			xmlNewTextChild(ip, ip->ns, BAD_CAST "forwarding", BAD_CAST tmp);
-			free(tmp);
-
-			if ((tmp = iface_get_ipv4_mtu(0, devices[i], &msg)) == NULL) {
-				goto next_ifc;
-			}
-			xmlNewTextChild(ip, ip->ns, BAD_CAST "mtu", BAD_CAST tmp);
-			free(tmp);
-
-			if (iface_get_ipv4_ipaddrs(0, devices[i], &ips, &msg) != 0) {
-				goto next_ifc;
-			}
-			for (j = 0; j < ips.count; ++j) {
-				addr = xmlNewChild(ip, ip->ns, BAD_CAST "address", NULL);
-				xmlNewTextChild(addr, addr->ns, BAD_CAST "ip", BAD_CAST ips.ip[j]);
-				xmlNewTextChild(addr, addr->ns, BAD_CAST "prefix-length", BAD_CAST ips.prefix_or_mac[j]);
-				xmlNewTextChild(addr, addr->ns, BAD_CAST "origin", BAD_CAST ips.origin[j]);
-
-				free(ips.ip[j]);
-				free(ips.prefix_or_mac[j]);
-				free(ips.origin[j]);
-
-				/* \todo: add gateway as an extension to the model */
-			}
-			if (ips.count != 0) {
-				free(ips.ip);
-				free(ips.prefix_or_mac);
-				free(ips.origin);
-				ips.count = 0;
-			}
-
-			if (iface_get_ipv4_neighs(0, devices[i], &ips, &msg) != 0) {
-				goto next_ifc;
-			}
-			for (j = 0; j < ips.count; ++j) {
-				addr = xmlNewChild(ip, ip->ns, BAD_CAST "neighbor", NULL);
-				xmlNewTextChild(addr, addr->ns, BAD_CAST "ip", BAD_CAST ips.ip[j]);
-				xmlNewTextChild(addr, addr->ns, BAD_CAST "link-layer-address", BAD_CAST ips.prefix_or_mac[j]);
-				xmlNewTextChild(addr, addr->ns, BAD_CAST "origin", BAD_CAST ips.origin[j]);
-
-				free(ips.ip[j]);
-				free(ips.prefix_or_mac[j]);
-				free(ips.origin[j]);
-			}
-			if (ips.count != 0) {
-				free(ips.ip);
-				free(ips.prefix_or_mac);
-				free(ips.origin);
-				ips.count = 0;
-			}
-		}
-
-		/* IPv6 */
-		if ((j = iface_get_ipv6_presence(0, devices[i], &msg)) == -1) {
-			goto next_ifc;
-		}
-		if (j) {
-			ip = xmlNewChild(interface, NULL, BAD_CAST "ipv6", NULL);
-			ipns = xmlNewNs(ip, BAD_CAST "urn:ietf:params:xml:ns:yang:ietf-ip", NULL);
-			xmlSetNs(ip, ipns);
-
-			if ((tmp = iface_get_ipv6_forwarding(0, devices[i], &msg)) == NULL) {
-				goto next_ifc;
-			}
-			xmlNewTextChild(ip, ip->ns, BAD_CAST "forwarding", BAD_CAST tmp);
-			free(tmp);
-
-			if ((tmp = iface_get_ipv6_mtu(0, devices[i], &msg)) == NULL) {
-				goto next_ifc;
-			}
-			xmlNewTextChild(ip, ip->ns, BAD_CAST "mtu", BAD_CAST tmp);
-			free(tmp);
-
-			if (iface_get_ipv6_ipaddrs(0, devices[i], &ips, &msg) != 0) {
-				goto next_ifc;
-			}
-			for (j = 0; j < ips.count; ++j) {
-				addr = xmlNewChild(ip, ip->ns, BAD_CAST "address", NULL);
-				xmlNewTextChild(addr, addr->ns, BAD_CAST "ip", BAD_CAST ips.ip[j]);
-				xmlNewTextChild(addr, addr->ns, BAD_CAST "prefix-length", BAD_CAST ips.prefix_or_mac[j]);
-				xmlNewTextChild(addr, addr->ns, BAD_CAST "origin", BAD_CAST ips.origin[j]);
-				xmlNewTextChild(addr, addr->ns, BAD_CAST "status", BAD_CAST ips.status_or_state[j]);
-
-				free(ips.ip[j]);
-				free(ips.prefix_or_mac[j]);
-				free(ips.origin[j]);
-				free(ips.status_or_state[j]);
-
-				/* \todo: add gateway as an extension to the model */
-			}
-			if (ips.count != 0) {
-				free(ips.ip);
-				free(ips.prefix_or_mac);
-				free(ips.origin);
-				free(ips.status_or_state);
-				ips.count = 0;
-			}
-
-			if (iface_get_ipv6_neighs(0, devices[i], &ips, &msg) != 0) {
-				goto next_ifc;
-			}
-			for (j = 0; j < ips.count; ++j) {
-				addr = xmlNewChild(ip, ip->ns, BAD_CAST "neighbor", NULL);
-				xmlNewTextChild(addr, addr->ns, BAD_CAST "ip", BAD_CAST ips.ip[j]);
-				xmlNewTextChild(addr, addr->ns, BAD_CAST "link-layer-address", BAD_CAST ips.prefix_or_mac[j]);
-				xmlNewTextChild(addr, addr->ns, BAD_CAST "origin", BAD_CAST ips.origin[j]);
-				if (ips.is_router[j]) {
-					xmlNewChild(addr, addr->ns, BAD_CAST "is-router", NULL);
-				}
-				xmlNewTextChild(addr, addr->ns, BAD_CAST "state", BAD_CAST ips.status_or_state[j]);
-
-				free(ips.ip[j]);
-				free(ips.prefix_or_mac[j]);
-				free(ips.origin[j]);
-				free(ips.status_or_state[j]);
-			}
-			if (ips.count != 0) {
-				free(ips.ip);
-				free(ips.prefix_or_mac);
-				free(ips.origin);
-				free(ips.is_router);
-				free(ips.status_or_state);
-				ips.count = 0;
-			}
-		}
-
-		next_ifc:
-
 		if (msg != NULL) {
 			nc_verb_error(msg);
 			free(msg);
@@ -660,7 +345,8 @@ xmlDocPtr get_state_data (xmlDocPtr model, xmlDocPtr running, struct nc_err **er
  */
 struct ns_pair namespace_mapping[] = {
 	{"if", "urn:ietf:params:xml:ns:yang:ietf-interfaces"},
-	{"ip", "urn:ietf:params:xml:ns:yang:ietf-ip"},
+	{"preempt", "urn:ieee:std:802.1Q:yang:ieee802-dot1q-sched"},
+	{"sched", "urn:ieee:std:802.1Q:yang:ieee802-dot1q-preemption"},
 	{NULL, NULL}
 };
 
@@ -688,11 +374,9 @@ int callback_if_interfaces_if_interface (void ** data, XMLDIFF_OP op, xmlNodePtr
 
 	free(iface_name);
 	iface_name = NULL;
-	iface_ignore = 0;
 
-	if (op & XMLDIFF_REM) {
-		iface_ignore = 1;
-	}
+	nc_verb_verbose("%s is calle", __func__);
+
 
 	for (cur = ((op & XMLDIFF_REM) ? old_node->children : new_node->children); cur != NULL; cur = cur->next) {
 		if (cur->children == NULL || cur->children->content == NULL) {
@@ -713,845 +397,6 @@ int callback_if_interfaces_if_interface (void ** data, XMLDIFF_OP op, xmlNodePtr
 }
 
 /**
- * @brief This callback will be run when node in path /if:interfaces/if:interface/ip:ipv4 changes
- *
- * @param[in] data	Double pointer to void. Its passed to every callback. You can share data using it.
- * @param[in] op	Observed change in path. XMLDIFF_OP type.
- * @param[in] node	Modified node. if op == XMLDIFF_REM its copy of node removed.
- * @param[out] error	If callback fails, it can return libnetconf error structure with a failure description.
- *
- * @return EXIT_SUCCESS or EXIT_FAILURE
- */
-/* !DO NOT ALTER FUNCTION SIGNATURE! */
-int callback_if_interfaces_if_interface_ip_ipv4 (void ** data, XMLDIFF_OP op, xmlNodePtr old_node, xmlNodePtr new_node, struct nc_err** error)
-{
-	xmlNodePtr cur;
-	char* msg = NULL, *ptr;
-	unsigned char loopback = 0;
-
-	if (iface_ignore) {
-		return EXIT_SUCCESS;
-	}
-
-	iface_ipv4addr_ignore = 0;
-	iface_ipv4enabled_ignore = 0;
-
-	/* learn the interface type */
-	for (cur = ((op & XMLDIFF_REM) ? old_node->parent->children : new_node->parent->children); cur != NULL; cur=cur->next) {
-		if (cur->children == NULL || cur->children->content == NULL) {
-			continue;
-		}
-
-		if (xmlStrEqual(cur->name, BAD_CAST "type")) {
-			ptr = (char*)cur->children->content;
-			if (strchr(ptr, ':') != NULL) {
-				ptr = strchr(ptr, ':')+1;
-			}
-			if (strcmp(ptr, "softwareLoopback") == 0) {
-				loopback = 1;
-			}
-			break;
-		}
-	}
-
-	if (op & XMLDIFF_ADD) {
-		/* set default values of the leaf children (enabled, forwarding)
-		 * since these nodes may not be present, but must be set
-		 */
-		if (iface_ipv4_forwarding(iface_name, 0, &msg) != EXIT_SUCCESS) {
-			return finish(msg, EXIT_FAILURE, error);
-		}
-		/* enable static IPv4 */
-		if (iface_ipv4_enabled(iface_name, 2, NULL, loopback, &msg) != EXIT_SUCCESS) {
-			return finish(msg, EXIT_FAILURE, error);
-		}
-	} else if (op & XMLDIFF_REM) {
-		/* "disable" */
-		if (iface_ipv4_enabled(iface_name, 0, NULL, loopback, &msg) != EXIT_SUCCESS) {
-			return finish(msg, EXIT_FAILURE, error);
-		}
-		/* if "enabled" is "false", it would normally change the interface to static addressing - wrong */
-		iface_ipv4enabled_ignore = 1;
-	}
-
-	return EXIT_SUCCESS;
-}
-
-/**
- * @brief This callback will be run when node in path /if:interfaces/if:interface/ip:ipv4/ip:enabled changes
- *
- * @param[in] data	Double pointer to void. Its passed to every callback. You can share data using it.
- * @param[in] op	Observed change in path. XMLDIFF_OP type.
- * @param[in] node	Modified node. if op == XMLDIFF_REM its copy of node removed.
- * @param[out] error	If callback fails, it can return libnetconf error structure with a failure description.
- *
- * @return EXIT_SUCCESS or EXIT_FAILURE
- */
-/* !DO NOT ALTER FUNCTION SIGNATURE! */
-int callback_if_interfaces_if_interface_ip_ipv4_ip_enabled (void ** data, XMLDIFF_OP op, xmlNodePtr old_node, xmlNodePtr new_node, struct nc_err** error)
-{
-	int ret;
-	xmlNodePtr cur, node;
-	char* msg = NULL, *ptr;
-	unsigned char enabled = 3, loopback = 0;
-
-	if (iface_ignore || iface_ipv4enabled_ignore) {
-		return EXIT_SUCCESS;
-	}
-
-	node = (op & XMLDIFF_REM ? old_node : new_node);
-
-	if (node->children == NULL || node->children->content == NULL) {
-		asprintf(&msg, "Empty node in \"%s\", internal error.", __func__);
-		return finish(msg, EXIT_FAILURE, error);
-	}
-
-	/* learn the interface type */
-	for (cur = node->parent->parent->children; cur != NULL; cur=cur->next) {
-		if (cur->children == NULL || cur->children->content == NULL) {
-			continue;
-		}
-
-		if (xmlStrEqual(cur->name, BAD_CAST "type")) {
-			ptr = (char*)cur->children->content;
-			if (strchr(ptr, ':') != NULL) {
-				ptr = strchr(ptr, ':')+1;
-			}
-			if (strcmp(ptr, "softwareLoopback") == 0) {
-				loopback = 1;
-			}
-			break;
-		}
-	}
-
-	if (op & XMLDIFF_REM && xmlStrEqual(node->children->content, BAD_CAST "false")) {
-		enabled = 2;
-	} else if (op & XMLDIFF_ADD && xmlStrEqual(node->children->content, BAD_CAST "false")) {
-		enabled = 1;
-	} else if (op & XMLDIFF_MOD) {
-		if (xmlStrEqual(node->children->content, BAD_CAST "false")) {
-			enabled = 1;
-		} else {
-			enabled = 2;
-		}
-	}
-
-	if (enabled == 3) {
-		/* no real interface change */
-		return EXIT_SUCCESS;
-	}
-
-	ret = iface_ipv4_enabled(iface_name, enabled, node, loopback, &msg);
-	iface_ipv4addr_ignore = 1;
-	return finish(msg, ret, error);
-}
-
-/**
- * @brief This callback will be run when node in path /if:interfaces/if:interface/ip:ipv4/ip:forwarding changes
- *
- * @param[in] data	Double pointer to void. Its passed to every callback. You can share data using it.
- * @param[in] op	Observed change in path. XMLDIFF_OP type.
- * @param[in] node	Modified node. if op == XMLDIFF_REM its copy of node removed.
- * @param[out] error	If callback fails, it can return libnetconf error structure with a failure description.
- *
- * @return EXIT_SUCCESS or EXIT_FAILURE
- */
-/* !DO NOT ALTER FUNCTION SIGNATURE! */
-int callback_if_interfaces_if_interface_ip_ipv4_ip_forwarding (void ** data, XMLDIFF_OP op, xmlNodePtr old_node, xmlNodePtr new_node, struct nc_err** error)
-{
-	int ret;
-	xmlNodePtr node;
-	char* msg = NULL;
-	unsigned char forwarding = 2;
-
-	if (iface_ignore) {
-		return EXIT_SUCCESS;
-	}
-
-	node = (op & XMLDIFF_REM ? old_node : new_node);
-
-	if (node->children == NULL || node->children->content == NULL) {
-		asprintf(&msg, "Empty node in \"%s\", internal error.", __func__);
-		return finish(msg, EXIT_FAILURE, error);
-	}
-
-	if (op & XMLDIFF_REM && xmlStrEqual(node->children->content, BAD_CAST "true")) {
-		forwarding = 0;
-	} else if (op & XMLDIFF_ADD && xmlStrEqual(node->children->content, BAD_CAST "true")) {
-		forwarding = 1;
-	} else if (op & XMLDIFF_MOD) {
-		if (xmlStrEqual(node->children->content, BAD_CAST "true")) {
-			forwarding = 1;
-		} else {
-			forwarding = 0;
-		}
-	}
-
-	if (forwarding == 2) {
-		/* no real interface change */
-		return EXIT_SUCCESS;
-	}
-
-	ret = iface_ipv4_forwarding(iface_name, forwarding, &msg);
-	return finish(msg, ret, error);
-}
-
-/**
- * @brief This callback will be run when node in path /if:interfaces/if:interface/ip:ipv4/ip:mtu changes
- *
- * @param[in] data	Double pointer to void. Its passed to every callback. You can share data using it.
- * @param[in] op	Observed change in path. XMLDIFF_OP type.
- * @param[in] node	Modified node. if op == XMLDIFF_REM its copy of node removed.
- * @param[out] error	If callback fails, it can return libnetconf error structure with a failure description.
- *
- * @return EXIT_SUCCESS or EXIT_FAILURE
- */
-/* !DO NOT ALTER FUNCTION SIGNATURE! */
-int callback_if_interfaces_if_interface_ip_ipv4_ip_mtu (void ** data, XMLDIFF_OP op, xmlNodePtr old_node, xmlNodePtr new_node, struct nc_err** error)
-{
-	int ret;
-	char* msg = NULL;
-	unsigned short mtu;
-
-	if (iface_ignore) {
-		return EXIT_SUCCESS;
-	}
-
-	if (op & XMLDIFF_REM) {
-		/* leave it be */
-		return EXIT_SUCCESS;
-	}
-
-	if (new_node->children == NULL || new_node->children->content == NULL) {
-		asprintf(&msg, "Empty node in \"%s\", internal error.", __func__);
-		return finish(msg, EXIT_FAILURE, error);
-	}
-
-	mtu = atoi((char*)new_node->children->content);
-	ret = iface_ipv4_mtu(iface_name, mtu, &msg);
-	return finish(msg, ret, error);
-}
-
-/**
- * @brief This callback will be run when node in path /if:interfaces/if:interface/ip:ipv4/ip:address changes
- *
- * @param[in] data	Double pointer to void. Its passed to every callback. You can share data using it.
- * @param[in] op	Observed change in path. XMLDIFF_OP type.
- * @param[in] node	Modified node. if op == XMLDIFF_REM its copy of node removed.
- * @param[out] error	If callback fails, it can return libnetconf error structure with a failure description.
- *
- * @return EXIT_SUCCESS or EXIT_FAILURE
- */
-/* !DO NOT ALTER FUNCTION SIGNATURE! */
-int callback_if_interfaces_if_interface_ip_ipv4_ip_address (void ** data, XMLDIFF_OP op, xmlNodePtr old_node, xmlNodePtr new_node, struct nc_err** error)
-{
-	int ret, i;
-	char* msg = NULL, *netmask = NULL, *ip = NULL;
-	unsigned char prefix_len = 0, octet, mask;
-	xmlNodePtr cur, node;
-
-	if (iface_ignore || iface_ipv4addr_ignore) {
-		return EXIT_SUCCESS;
-	}
-
-	node = (op & XMLDIFF_REM ? new_node : old_node);
-
-	for (cur = node->children; cur != NULL; cur = cur->next) {
-		if (cur->children == NULL || cur->children->content == NULL) {
-			continue;
-		}
-
-		if (xmlStrEqual(cur->name, BAD_CAST "ip")) {
-			ip = strdup((char*)cur->children->content);
-		}
-		if (xmlStrEqual(cur->name, BAD_CAST "prefix-length")) {
-			prefix_len = atoi((char*)cur->children->content);
-		}
-		if (xmlStrEqual(cur->name, BAD_CAST "netmask")) {
-			netmask = strdup((char*)cur->children->content);
-		}
-	}
-
-	if (ip == NULL) {
-		msg = strdup("Missing ip address in an IPv4 address.");
-		free(netmask);
-		return finish(msg, EXIT_FAILURE, error);
-	}
-	if ((prefix_len == 0 && netmask == NULL) || (prefix_len != 0 && netmask != NULL)) {
-		asprintf(&msg, "Cannot get subnet for the IP \"%s\".", ip);
-		free(ip);
-		free(netmask);
-		return finish(msg, EXIT_FAILURE, error);
-	}
-
-	if (netmask != NULL) {
-		prefix_len = 0;
-		mask = 0x80;
-		octet = (unsigned)atoi(strtok(netmask, "."));
-		i = 0;
-		while (mask & octet) {
-			++prefix_len;
-			mask >>= 1;
-			++i;
-			if (i == 32) {
-				break;
-			}
-			if (i % 8 == 0) {
-				octet = (unsigned)atoi(strtok(NULL, "."));
-				mask = 0x80;
-			}
-		}
-		free(netmask);
-	}
-
-	ret = iface_ipv4_ip(iface_name, ip, prefix_len, op, &msg);
-	return finish(msg, ret, error);
-}
-
-/**
- * @brief This callback will be run when node in path /if:interfaces/if:interface/ip:ipv4/ip:neighbor changes
- *
- * @param[in] data	Double pointer to void. Its passed to every callback. You can share data using it.
- * @param[in] op	Observed change in path. XMLDIFF_OP type.
- * @param[in] node	Modified node. if op == XMLDIFF_REM its copy of node removed.
- * @param[out] error	If callback fails, it can return libnetconf error structure with a failure description.
- *
- * @return EXIT_SUCCESS or EXIT_FAILURE
- */
-/* !DO NOT ALTER FUNCTION SIGNATURE! */
-int callback_if_interfaces_if_interface_ip_ipv4_ip_neighbor (void ** data, XMLDIFF_OP op, xmlNodePtr old_node, xmlNodePtr new_node, struct nc_err** error)
-{
-	int ret;
-	char* msg = NULL, *ip = NULL, *mac = NULL;
-	xmlNodePtr cur, node;
-
-	if (iface_ignore) {
-		return EXIT_SUCCESS;
-	}
-
-	node = (op & XMLDIFF_REM ? old_node : new_node);
-
-	for (cur = node->children; cur != NULL; cur = cur->next) {
-		if (cur->children == NULL || cur->children->content == NULL) {
-			continue;
-		}
-
-		if (xmlStrEqual(cur->name, BAD_CAST "ip")) {
-			ip = strdup((char*)cur->children->content);
-		}
-		if (xmlStrEqual(cur->name, BAD_CAST "link-layer-address")) {
-			mac = strdup((char*)cur->children->content);
-		}
-	}
-
-	if (ip == NULL) {
-		msg = strdup("Missing ip address in an IPv4 neighbor.");
-		free(mac);
-		return finish(msg, EXIT_FAILURE, error);
-	}
-	if (mac == NULL) {
-		asprintf(&msg, "Cannot get MAC for the neighbor \"%s\".", ip);
-		free(ip);
-		return finish(msg, EXIT_FAILURE, error);
-	}
-
-	ret = iface_ipv4_neighbor(iface_name, ip, mac, op, &msg);
-	return finish(msg, ret, error);
-}
-
-/**
- * @brief This callback will be run when node in path /if:interfaces/if:interface/ip:ipv6 changes
- *
- * @param[in] data	Double pointer to void. Its passed to every callback. You can share data using it.
- * @param[in] op	Observed change in path. XMLDIFF_OP type.
- * @param[in] node	Modified node. if op == XMLDIFF_REM its copy of node removed.
- * @param[out] error	If callback fails, it can return libnetconf error structure with a failure description.
- *
- * @return EXIT_SUCCESS or EXIT_FAILURE
- */
-/* !DO NOT ALTER FUNCTION SIGNATURE! */
-int callback_if_interfaces_if_interface_ip_ipv6 (void ** data, XMLDIFF_OP op, xmlNodePtr old_node, xmlNodePtr new_node, struct nc_err** error)
-{
-	char* msg = NULL;
-
-	if (iface_ignore) {
-		return EXIT_SUCCESS;
-	}
-
-	if (op & XMLDIFF_ADD) {
-		/* set default values of the leaf children (enabled, forwarding, create-global-addresses)
-		 * since these nodes may not be present, but must be set
-		 */
-		if (iface_ipv6_forwarding(iface_name, 0, &msg) != EXIT_SUCCESS) {
-			return finish(msg, EXIT_FAILURE, error);
-		}
-		if (iface_ipv6_creat_glob_addr(iface_name, 1, &msg) != EXIT_SUCCESS) {
-			return finish(msg, EXIT_FAILURE, error);
-		}
-		if (iface_ipv6_enabled(iface_name, 1, &msg) != EXIT_SUCCESS) {
-			return finish(msg, EXIT_FAILURE, error);
-		}
-	}
-
-	return EXIT_SUCCESS;
-}
-
-/**
- * @brief This callback will be run when node in path /if:interfaces/if:interface/ip:ipv6/ip:enabled changes
- *
- * @param[in] data	Double pointer to void. Its passed to every callback. You can share data using it.
- * @param[in] op	Observed change in path. XMLDIFF_OP type.
- * @param[in] node	Modified node. if op == XMLDIFF_REM its copy of node removed.
- * @param[out] error	If callback fails, it can return libnetconf error structure with a failure description.
- *
- * @return EXIT_SUCCESS or EXIT_FAILURE
- */
-/* !DO NOT ALTER FUNCTION SIGNATURE! */
-int callback_if_interfaces_if_interface_ip_ipv6_ip_enabled (void ** data, XMLDIFF_OP op, xmlNodePtr old_node, xmlNodePtr new_node, struct nc_err** error)
-{
-	int ret;
-	char* msg = NULL;
-	unsigned char enabled = 2;
-	xmlNodePtr node;
-
-	if (iface_ignore) {
-		return EXIT_SUCCESS;
-	}
-
-	node = (op & XMLDIFF_REM ? old_node : new_node);
-
-	if (node->children == NULL || node->children->content == NULL) {
-		asprintf(&msg, "Empty node in \"%s\", internal error.", __func__);
-		return finish(msg, EXIT_FAILURE, error);
-	}
-
-	if (op & XMLDIFF_REM && xmlStrEqual(node->children->content, BAD_CAST "false")) {
-		enabled = 1;
-	} else if (op & XMLDIFF_ADD && xmlStrEqual(node->children->content, BAD_CAST "false")) {
-		enabled = 0;
-	} else if (op & XMLDIFF_MOD) {
-		if (xmlStrEqual(node->children->content, BAD_CAST "false")) {
-			enabled = 0;
-		} else {
-			enabled = 1;
-		}
-	}
-
-	if (enabled == 2) {
-		/* no real interface change */
-		return EXIT_SUCCESS;
-	}
-
-	ret = iface_ipv6_enabled(iface_name, enabled, &msg);
-	return finish(msg, ret, error);
-}
-
-/**
- * @brief This callback will be run when node in path /if:interfaces/if:interface/ip:ipv6/ip:forwarding changes
- *
- * @param[in] data	Double pointer to void. Its passed to every callback. You can share data using it.
- * @param[in] op	Observed change in path. XMLDIFF_OP type.
- * @param[in] node	Modified node. if op == XMLDIFF_REM its copy of node removed.
- * @param[out] error	If callback fails, it can return libnetconf error structure with a failure description.
- *
- * @return EXIT_SUCCESS or EXIT_FAILURE
- */
-/* !DO NOT ALTER FUNCTION SIGNATURE! */
-int callback_if_interfaces_if_interface_ip_ipv6_ip_forwarding (void ** data, XMLDIFF_OP op, xmlNodePtr old_node, xmlNodePtr new_node, struct nc_err** error)
-{
-	int ret;
-	char* msg = NULL;
-	unsigned char forwarding = 2;
-	xmlNodePtr node;
-
-	if (iface_ignore) {
-		return EXIT_SUCCESS;
-	}
-
-	node = (op & XMLDIFF_REM ? old_node : new_node);
-
-	if (node->children == NULL || node->children->content == NULL) {
-		asprintf(&msg, "Empty node in \"%s\", internal error.", __func__);
-		return finish(msg, EXIT_FAILURE, error);
-	}
-
-	if (op & XMLDIFF_REM && xmlStrEqual(node->children->content, BAD_CAST "true")) {
-		forwarding = 0;
-	} else if (op & XMLDIFF_ADD && xmlStrEqual(node->children->content, BAD_CAST "true")) {
-		forwarding = 1;
-	} else if (op & XMLDIFF_MOD) {
-		if (xmlStrEqual(node->children->content, BAD_CAST "true")) {
-			forwarding = 1;
-		} else {
-			forwarding = 0;
-		}
-	}
-
-	if (forwarding == 2) {
-		/* no real interface change */
-		return EXIT_SUCCESS;
-	}
-
-	ret = iface_ipv6_forwarding(iface_name, forwarding, &msg);
-	return finish(msg, ret, error);
-}
-
-/**
- * @brief This callback will be run when node in path /if:interfaces/if:interface/ip:ipv6/ip:mtu changes
- *
- * @param[in] data	Double pointer to void. Its passed to every callback. You can share data using it.
- * @param[in] op	Observed change in path. XMLDIFF_OP type.
- * @param[in] node	Modified node. if op == XMLDIFF_REM its copy of node removed.
- * @param[out] error	If callback fails, it can return libnetconf error structure with a failure description.
- *
- * @return EXIT_SUCCESS or EXIT_FAILURE
- */
-/* !DO NOT ALTER FUNCTION SIGNATURE! */
-int callback_if_interfaces_if_interface_ip_ipv6_ip_mtu (void ** data, XMLDIFF_OP op, xmlNodePtr old_node, xmlNodePtr new_node, struct nc_err** error)
-{
-	int ret;
-	char* msg = NULL;
-	unsigned short mtu;
-
-	if (iface_ignore) {
-		return EXIT_SUCCESS;
-	}
-
-	if (op & XMLDIFF_REM) {
-		/* leave it be */
-		return EXIT_SUCCESS;
-	}
-
-	if (new_node->children == NULL || new_node->children->content == NULL) {
-		asprintf(&msg, "Empty node in \"%s\", internal error.", __func__);
-		return finish(msg, EXIT_FAILURE, error);
-	}
-
-	mtu = atoi((char*)new_node->children->content);
-	ret = iface_ipv6_mtu(iface_name, mtu, &msg);
-	return finish(msg, ret, error);
-}
-
-/**
- * @brief This callback will be run when node in path /if:interfaces/if:interface/ip:ipv6/ip:address changes
- *
- * @param[in] data	Double pointer to void. Its passed to every callback. You can share data using it.
- * @param[in] op	Observed change in path. XMLDIFF_OP type.
- * @param[in] node	Modified node. if op == XMLDIFF_REM its copy of node removed.
- * @param[out] error	If callback fails, it can return libnetconf error structure with a failure description.
- *
- * @return EXIT_SUCCESS or EXIT_FAILURE
- */
-/* !DO NOT ALTER FUNCTION SIGNATURE! */
-int callback_if_interfaces_if_interface_ip_ipv6_ip_address (void ** data, XMLDIFF_OP op, xmlNodePtr old_node, xmlNodePtr new_node, struct nc_err** error)
-{
-	int ret;
-	char* msg = NULL, *ip = NULL;
-	unsigned char prefix_len = 0;
-	xmlNodePtr cur, node;
-
-	if (iface_ignore) {
-		return EXIT_SUCCESS;
-	}
-
-	node = (op & XMLDIFF_REM ? old_node : new_node);
-
-	for (cur = node->children; cur != NULL; cur = cur->next) {
-		if (cur->children == NULL || cur->children->content == NULL) {
-			continue;
-		}
-
-		if (xmlStrEqual(cur->name, BAD_CAST "ip")) {
-			ip = strdup((char*)cur->children->content);
-		}
-		if (xmlStrEqual(cur->name, BAD_CAST "prefix-length")) {
-			prefix_len = atoi((char*)cur->children->content);
-		}
-	}
-
-	if (ip == NULL) {
-		msg = strdup("Missing ip address in an IPv6 address.");
-		return finish(msg, EXIT_FAILURE, error);
-	}
-	if (prefix_len == 0) {
-		asprintf(&msg, "Cannot get subnet for the IP \"%s\".", ip);
-		free(ip);
-		return finish(msg, EXIT_FAILURE, error);
-	}
-
-	ret = iface_ipv6_ip(iface_name, ip, prefix_len, op, &msg);
-	return finish(msg, ret, error);
-}
-
-/**
- * @brief This callback will be run when node in path /if:interfaces/if:interface/ip:ipv6/ip:neighbor changes
- *
- * @param[in] data	Double pointer to void. Its passed to every callback. You can share data using it.
- * @param[in] op	Observed change in path. XMLDIFF_OP type.
- * @param[in] node	Modified node. if op == XMLDIFF_REM its copy of node removed.
- * @param[out] error	If callback fails, it can return libnetconf error structure with a failure description.
- *
- * @return EXIT_SUCCESS or EXIT_FAILURE
- */
-/* !DO NOT ALTER FUNCTION SIGNATURE! */
-int callback_if_interfaces_if_interface_ip_ipv6_ip_neighbor (void ** data, XMLDIFF_OP op, xmlNodePtr old_node, xmlNodePtr new_node, struct nc_err** error)
-{
-	int ret;
-	char* msg = NULL, *ip = NULL, *mac = NULL;
-	xmlNodePtr cur, node;
-
-	if (iface_ignore) {
-		return EXIT_SUCCESS;
-	}
-
-	node = (op & XMLDIFF_REM ? old_node : new_node);
-
-	for (cur = node->children; cur != NULL; cur = cur->next) {
-		if (cur->children == NULL || cur->children->content == NULL) {
-			continue;
-		}
-
-		if (xmlStrEqual(cur->name, BAD_CAST "ip")) {
-			ip = strdup((char*)cur->children->content);
-		}
-		if (xmlStrEqual(cur->name, BAD_CAST "link-layer-address")) {
-			mac = strdup((char*)cur->children->content);
-		}
-	}
-
-	if (ip == NULL) {
-		msg = strdup("Missing ip address in an IPv6 neighbor.");
-		free(mac);
-		return finish(msg, EXIT_FAILURE, error);
-	}
-	if (mac == NULL) {
-		asprintf(&msg, "Cannot get MAC for the neighbor \"%s\".", ip);
-		free(ip);
-		return finish(msg, EXIT_FAILURE, error);
-	}
-
-	ret = iface_ipv6_neighbor(iface_name, ip, mac, op, &msg);
-	return finish(msg, ret, error);
-}
-
-/**
- * @brief This callback will be run when node in path /if:interfaces/if:interface/ip:ipv6/ip:dup-addr-detect-transmits changes
- *
- * @param[in] data	Double pointer to void. Its passed to every callback. You can share data using it.
- * @param[in] op	Observed change in path. XMLDIFF_OP type.
- * @param[in] node	Modified node. if op == XMLDIFF_REM its copy of node removed.
- * @param[out] error	If callback fails, it can return libnetconf error structure with a failure description.
- *
- * @return EXIT_SUCCESS or EXIT_FAILURE
- */
-/* !DO NOT ALTER FUNCTION SIGNATURE! */
-int callback_if_interfaces_if_interface_ip_ipv6_ip_dup_addr_detect_transmits (void ** data, XMLDIFF_OP op, xmlNodePtr old_node, xmlNodePtr new_node, struct nc_err** error)
-{
-	int ret;
-	char* msg = NULL;
-	unsigned int dup_addr_det;
-	xmlNodePtr node;
-
-	if (iface_ignore) {
-		return EXIT_SUCCESS;
-	}
-
-	node = (op & XMLDIFF_REM ? old_node : new_node);
-
-	if (node->children == NULL || node->children->content == NULL) {
-		asprintf(&msg, "Empty node in \"%s\", internal error.", __func__);
-		return finish(msg, EXIT_FAILURE, error);
-	}
-
-	if (op & XMLDIFF_REM) {
-		dup_addr_det = 1;
-	} else {
-		dup_addr_det = atoi((char*)node->children->content);
-	}
-
-	ret = iface_ipv6_dup_addr_det(iface_name, dup_addr_det, &msg);
-	return finish(msg, ret, error);
-}
-
-/**
- * @brief This callback will be run when node in path /if:interfaces/if:interface/ip:ipv6/ip:autoconf/ip:create-global-addresses changes
- *
- * @param[in] data	Double pointer to void. Its passed to every callback. You can share data using it.
- * @param[in] op	Observed change in path. XMLDIFF_OP type.
- * @param[in] node	Modified node. if op == XMLDIFF_REM its copy of node removed.
- * @param[out] error	If callback fails, it can return libnetconf error structure with a failure description.
- *
- * @return EXIT_SUCCESS or EXIT_FAILURE
- */
-/* !DO NOT ALTER FUNCTION SIGNATURE! */
-int callback_if_interfaces_if_interface_ip_ipv6_ip_autoconf_ip_create_global_addresses (void ** data, XMLDIFF_OP op, xmlNodePtr old_node, xmlNodePtr new_node, struct nc_err** error)
-{
-	int ret;
-	char* msg = NULL;
-	unsigned char creat_glob_addr = 2;
-	xmlNodePtr node;
-
-	if (iface_ignore) {
-		return EXIT_SUCCESS;
-	}
-
-	node = (op & XMLDIFF_REM ? old_node : new_node);
-
-	if (node->children == NULL || node->children->content == NULL) {
-		asprintf(&msg, "Empty node in \"%s\", internal error.", __func__);
-		return finish(msg, EXIT_FAILURE, error);
-	}
-
-	if (op & XMLDIFF_REM && xmlStrEqual(node->children->content, BAD_CAST "false")) {
-		creat_glob_addr = 1;
-	} else if (op & XMLDIFF_ADD && xmlStrEqual(node->children->content, BAD_CAST "false")) {
-		creat_glob_addr = 0;
-	} else if (op & XMLDIFF_MOD) {
-		if (xmlStrEqual(node->children->content, BAD_CAST "false")) {
-			creat_glob_addr = 0;
-		} else {
-			creat_glob_addr = 1;
-		}
-	}
-
-	if (creat_glob_addr == 2) {
-		/* no real interface change */
-		return EXIT_SUCCESS;
-	}
-
-	ret = iface_ipv6_creat_glob_addr(iface_name, creat_glob_addr, &msg);
-	return finish(msg, ret, error);
-}
-
-/**
- * @brief This callback will be run when node in path /if:interfaces/if:interface/ip:ipv6/ip:autoconf/ip:create-temporary-addresses changes
- *
- * @param[in] data	Double pointer to void. Its passed to every callback. You can share data using it.
- * @param[in] op	Observed change in path. XMLDIFF_OP type.
- * @param[in] node	Modified node. if op == XMLDIFF_REM its copy of node removed.
- * @param[out] error	If callback fails, it can return libnetconf error structure with a failure description.
- *
- * @return EXIT_SUCCESS or EXIT_FAILURE
- */
-/* !DO NOT ALTER FUNCTION SIGNATURE! */
-int callback_if_interfaces_if_interface_ip_ipv6_ip_autoconf_ip_create_temporary_addresses (void ** data, XMLDIFF_OP op, xmlNodePtr old_node, xmlNodePtr new_node, struct nc_err** error)
-{
-	int ret;
-	char* msg = NULL;
-	unsigned char creat_temp_addr = 2;
-	xmlNodePtr node;
-
-	if (iface_ignore) {
-		return EXIT_SUCCESS;
-	}
-
-	node = (op & XMLDIFF_REM ? old_node : new_node);
-
-	if (node->children == NULL || node->children->content == NULL) {
-		asprintf(&msg, "Empty node in \"%s\", internal error.", __func__);
-		return finish(msg, EXIT_FAILURE, error);
-	}
-
-	if (op & XMLDIFF_REM && xmlStrEqual(node->children->content, BAD_CAST "true")) {
-		creat_temp_addr = 0;
-	} else if (op & XMLDIFF_ADD && xmlStrEqual(node->children->content, BAD_CAST "true")) {
-		creat_temp_addr = 1;
-	} else if (op & XMLDIFF_MOD) {
-		if (xmlStrEqual(node->children->content, BAD_CAST "true")) {
-			creat_temp_addr = 1;
-		} else {
-			creat_temp_addr = 0;
-		}
-	}
-
-	if (creat_temp_addr == 2) {
-		/* no real interface change */
-		return EXIT_SUCCESS;
-	}
-
-	ret = iface_ipv6_creat_temp_addr(iface_name, creat_temp_addr, &msg);
-	return finish(msg, ret, error);
-}
-
-/**
- * @brief This callback will be run when node in path /if:interfaces/if:interface/ip:ipv6/ip:autoconf/ip:temporary-valid-lifetime changes
- *
- * @param[in] data	Double pointer to void. Its passed to every callback. You can share data using it.
- * @param[in] op	Observed change in path. XMLDIFF_OP type.
- * @param[in] node	Modified node. if op == XMLDIFF_REM its copy of node removed.
- * @param[out] error	If callback fails, it can return libnetconf error structure with a failure description.
- *
- * @return EXIT_SUCCESS or EXIT_FAILURE
- */
-/* !DO NOT ALTER FUNCTION SIGNATURE! */
-int callback_if_interfaces_if_interface_ip_ipv6_ip_autoconf_ip_temporary_valid_lifetime (void ** data, XMLDIFF_OP op, xmlNodePtr old_node, xmlNodePtr new_node, struct nc_err** error)
-{
-	int ret;
-	char* msg = NULL;
-	unsigned int temp_val_lft;
-	xmlNodePtr node;
-
-	if (iface_ignore) {
-		return EXIT_SUCCESS;
-	}
-
-	node = (op & XMLDIFF_REM ? old_node : new_node);
-
-	if (node->children == NULL || node->children->content == NULL) {
-		asprintf(&msg, "Empty node in \"%s\", internal error.", __func__);
-		return finish(msg, EXIT_FAILURE, error);
-	}
-
-	if (op & XMLDIFF_REM) {
-		temp_val_lft = 604800;
-	} else {
-		temp_val_lft = atoi((char*)node->children->content);
-	}
-
-	ret = iface_ipv6_temp_val_lft(iface_name, temp_val_lft, &msg);
-	return finish(msg, ret, error);
-}
-
-/**
- * @brief This callback will be run when node in path /if:interfaces/if:interface/ip:ipv6/ip:autoconf/ip:temporary-preferred-lifetime changes
- *
- * @param[in] data	Double pointer to void. Its passed to every callback. You can share data using it.
- * @param[in] op	Observed change in path. XMLDIFF_OP type.
- * @param[in] node	Modified node. if op == XMLDIFF_REM its copy of node removed.
- * @param[out] error	If callback fails, it can return libnetconf error structure with a failure description.
- *
- * @return EXIT_SUCCESS or EXIT_FAILURE
- */
-/* !DO NOT ALTER FUNCTION SIGNATURE! */
-int callback_if_interfaces_if_interface_ip_ipv6_ip_autoconf_ip_temporary_preferred_lifetime (void ** data, XMLDIFF_OP op, xmlNodePtr old_node, xmlNodePtr new_node, struct nc_err** error)
-{
-	int ret;
-	char* msg = NULL;
-	unsigned int temp_pref_lft;
-	xmlNodePtr node;
-
-	if (iface_ignore) {
-		return EXIT_SUCCESS;
-	}
-
-	node = (op & XMLDIFF_REM ? old_node : new_node);
-
-	if (node->children == NULL || node->children->content == NULL) {
-		asprintf(&msg, "Empty node in \"%s\", internal error.", __func__);
-		return finish(msg, EXIT_FAILURE, error);
-	}
-
-	if (op & XMLDIFF_REM) {
-		temp_pref_lft = 86400;
-	} else {
-		temp_pref_lft = atoi((char*)node->children->content);
-	}
-
-	ret = iface_ipv6_temp_pref_lft(iface_name, temp_pref_lft, &msg);
-	return finish(msg, ret, error);
-}
-
-/**
  * @brief This callback will be run when node in path /if:interfaces/if:interface/if:enabled changes
  *
  * @param[in] data	Double pointer to void. Its passed to every callback. You can share data using it.
@@ -1562,15 +407,11 @@ int callback_if_interfaces_if_interface_ip_ipv6_ip_autoconf_ip_temporary_preferr
  * @return EXIT_SUCCESS or EXIT_FAILURE
  */
 /* !DO NOT ALTER FUNCTION SIGNATURE! */
-int callback_if_interfaces_if_interface_if_enabled (void ** data, XMLDIFF_OP op, xmlNodePtr old_node, xmlNodePtr new_node, struct nc_err** error) {
-	int ret;
+int callback_gate_enabled (void ** data, XMLDIFF_OP op, xmlNodePtr old_node, xmlNodePtr new_node, struct nc_err** error) {
+	
 	char* msg = NULL;
-	unsigned char enabled = 2;
 	xmlNodePtr node;
 
-	if (iface_ignore) {
-		return EXIT_SUCCESS;
-	}
 
 	node = (op & XMLDIFF_REM ? old_node : new_node);
 
@@ -1578,26 +419,12 @@ int callback_if_interfaces_if_interface_if_enabled (void ** data, XMLDIFF_OP op,
 		asprintf(&msg, "Empty node in \"%s\", internal error.", __func__);
 		return finish(msg, EXIT_FAILURE, error);
 	}
+	
+	nc_verb_verbose("%s is calle", __func__);
+	if (node->children->content)
+		nc_verb_verbose("enable value is:%s", BAD_CAST node->children->content);
 
-	if (op & XMLDIFF_REM && xmlStrEqual(node->children->content, BAD_CAST "false")) {
-		enabled = 1;
-	} else if (op & XMLDIFF_ADD && xmlStrEqual(node->children->content, BAD_CAST "false")) {
-		enabled = 0;
-	} else if (op & XMLDIFF_MOD) {
-		if (xmlStrEqual(node->children->content, BAD_CAST "false")) {
-			enabled = 0;
-		} else {
-			enabled = 1;
-		}
-	}
-
-	if (enabled == 2) {
-		/* no real interface change */
-		return EXIT_SUCCESS;
-	}
-
-	ret = iface_enabled(iface_name, enabled, &msg);
-	return finish(msg, ret, error);
+	return EXIT_SUCCESS;
 }
 
 /*
@@ -1606,28 +433,11 @@ int callback_if_interfaces_if_interface_if_enabled (void ** data, XMLDIFF_OP op,
 * DO NOT alter this structure
 */
 struct transapi_data_callbacks clbks =  {
-	.callbacks_count = 19,
+	.callbacks_count = 2,
 	.data = NULL,
 	.callbacks = {
 		{.path = "/if:interfaces/if:interface", .func = callback_if_interfaces_if_interface},
-		{.path = "/if:interfaces/if:interface/ip:ipv4", .func = callback_if_interfaces_if_interface_ip_ipv4},
-		{.path = "/if:interfaces/if:interface/ip:ipv4/ip:enabled", .func = callback_if_interfaces_if_interface_ip_ipv4_ip_enabled},
-		{.path = "/if:interfaces/if:interface/ip:ipv4/ip:forwarding", .func = callback_if_interfaces_if_interface_ip_ipv4_ip_forwarding},
-		{.path = "/if:interfaces/if:interface/ip:ipv4/ip:mtu", .func = callback_if_interfaces_if_interface_ip_ipv4_ip_mtu},
-		{.path = "/if:interfaces/if:interface/ip:ipv4/ip:address", .func = callback_if_interfaces_if_interface_ip_ipv4_ip_address},
-		{.path = "/if:interfaces/if:interface/ip:ipv4/ip:neighbor", .func = callback_if_interfaces_if_interface_ip_ipv4_ip_neighbor},
-		{.path = "/if:interfaces/if:interface/ip:ipv6", .func = callback_if_interfaces_if_interface_ip_ipv6},
-		{.path = "/if:interfaces/if:interface/ip:ipv6/ip:enabled", .func = callback_if_interfaces_if_interface_ip_ipv6_ip_enabled},
-		{.path = "/if:interfaces/if:interface/ip:ipv6/ip:forwarding", .func = callback_if_interfaces_if_interface_ip_ipv6_ip_forwarding},
-		{.path = "/if:interfaces/if:interface/ip:ipv6/ip:mtu", .func = callback_if_interfaces_if_interface_ip_ipv6_ip_mtu},
-		{.path = "/if:interfaces/if:interface/ip:ipv6/ip:address", .func = callback_if_interfaces_if_interface_ip_ipv6_ip_address},
-		{.path = "/if:interfaces/if:interface/ip:ipv6/ip:neighbor", .func = callback_if_interfaces_if_interface_ip_ipv6_ip_neighbor},
-		{.path = "/if:interfaces/if:interface/ip:ipv6/ip:dup-addr-detect-transmits", .func = callback_if_interfaces_if_interface_ip_ipv6_ip_dup_addr_detect_transmits},
-		{.path = "/if:interfaces/if:interface/ip:ipv6/ip:autoconf/ip:create-global-addresses", .func = callback_if_interfaces_if_interface_ip_ipv6_ip_autoconf_ip_create_global_addresses},
-		{.path = "/if:interfaces/if:interface/ip:ipv6/ip:autoconf/ip:create-temporary-addresses", .func = callback_if_interfaces_if_interface_ip_ipv6_ip_autoconf_ip_create_temporary_addresses},
-		{.path = "/if:interfaces/if:interface/ip:ipv6/ip:autoconf/ip:temporary-valid-lifetime", .func = callback_if_interfaces_if_interface_ip_ipv6_ip_autoconf_ip_temporary_valid_lifetime},
-		{.path = "/if:interfaces/if:interface/ip:ipv6/ip:autoconf/ip:temporary-preferred-lifetime", .func = callback_if_interfaces_if_interface_ip_ipv6_ip_autoconf_ip_temporary_preferred_lifetime},
-		{.path = "/if:interfaces/if:interface/if:enabled", .func = callback_if_interfaces_if_interface_if_enabled}
+		{.path = "/if:interfaces/if:interface/sched:gate-parameters/sched:gate-enabled", .func = callback_gate_enabled},
 	}
 };
 
@@ -1650,27 +460,3 @@ struct transapi_rpc_callbacks rpc_clbks = {
 	}
 };
 
-int cfginterfaces_file_change_cb(const char *filepath, xmlDocPtr *edit_config, int *exec)
-{
-	xmlNodePtr root;
-
-	*exec = 0;
-
-	if (transapi_init(edit_config) != EXIT_SUCCESS || (root = xmlDocGetRootElement(*edit_config)) == NULL) {
-		*edit_config = NULL;
-		return EXIT_FAILURE;
-	}
-
-	xmlNewNs(root, BAD_CAST "urn:ietf:params:xml:ns:netconf:base:1.0", BAD_CAST "ncop");
-	xmlSetProp(root, BAD_CAST "ncop:operation", BAD_CAST "replace");
-
-	return EXIT_SUCCESS;
-}
-
-struct transapi_file_callbacks file_clbks = {
-	.callbacks_count = 2,
-	.callbacks = {
-		{.path = "/etc/sysctl.conf", .func = cfginterfaces_file_change_cb},
-		{.path = "/etc/network/interfaces", .func = cfginterfaces_file_change_cb}
-	}
-};

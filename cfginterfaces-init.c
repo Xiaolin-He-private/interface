@@ -111,7 +111,7 @@ int main(int argc, char** argv)
 	nc_reply* reply;
 	char* new_startup_config;
 	xmlDocPtr startup_doc = NULL;
-	int ret = 0, i, j;
+	int ret = 0, j;
 
 	if (argc < 2 || argv[1][0] == '-') {
 		help(argv[0]);
@@ -134,26 +134,42 @@ int main(int argc, char** argv)
 	}
 
 	/* add imports and augments */
-	if (ncds_add_model("./model/ietf-yang-types.yin") != 0 || ncds_add_model("./model/ietf-inet-types.yin") != 0 ||
-			ncds_add_model("./model/ietf-ip.yin") != 0) {
+	if (ncds_add_model("./model/ietf-yang-types.yin") != 0 || ncds_add_model("./model/ieee802-dot1q-types.yin") != 0 ||
+			ncds_add_model("./model/802.1/Qcw/ieee802-dot1q-preemption.yin") != 0 ||
+			ncds_add_model("./model/802.1/Qcw/ieee802-dot1q-sched.yin") != 0) {
 		nc_verb_error("Could not add import and augment models.");
 		nc_close();
 		return 1;
 	}
 
 	/* enable features */
-	for (i = 2; i < argc; ++i) {
-		if (strcmp(argv[i], "ipv4-non-contiguous-netmasks") == 0 || strcmp(argv[i], "ipv6-privacy-autoconf") == 0) {
-			j = ncds_feature_enable("ietf-ip", argv[i]);
-		} else {
-			j = ncds_feature_enable("ietf-interfaces", argv[i]);
-		}
-
-		if (j != 0) {
-			nc_verb_error("Could not enable feature \"%s\".", argv[i]);
-			nc_close();
-			return 1;
-		}
+/*
+	j = ncds_feature_enable("ietf-interfaces", "frame-preemption");
+	if (j != 0) {
+		nc_verb_error("Could not enable feature \"%s\" 1.", "frame-preemption");
+		nc_close();
+		return 1;
+	}
+*/
+	j = ncds_feature_enable("ieee802-dot1q-preemption", "frame-preemption");
+	if (j != 0) {
+		nc_verb_error("Could not enable feature \"%s\" 2.", "frame-preemption");
+		nc_close();
+		return 1;
+	}
+/*
+	j = ncds_feature_enable("ieee802-dot1q-sched", "scheduled-traffic");
+	if (j != 0) {
+		nc_verb_error("Could not enable feature \"%s\". 1", "scheduled-traffic");
+		nc_close();
+		return 1;
+	}
+*/
+	j = ncds_feature_enable("ieee802-dot1q-sched", "scheduled-traffic");
+	if (j != 0) {
+		nc_verb_error("Could not enable feature \"%s\". 2", "scheduled-traffic");
+		nc_close();
+		return 1;
 	}
 
 	/* set the path to the target file */

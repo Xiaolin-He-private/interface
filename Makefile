@@ -1,4 +1,4 @@
-PKGNAME = cfginterfaces
+ddPKGNAME = cfginterfaces
 TARGET = cfginterfaces
 MODULE = $(TARGET).la
 
@@ -26,14 +26,14 @@ LIBTOOL = $(libtool) --tag=CC --quiet
 NETOPEER_MANAGER = /usr/local/bin/netopeer-manager
 
 MODEL = model/ietf-interfaces.yin \
-	model/ietf-ip.yin \
-	model/iana-if-type.yin \
+	model/802.1/Qcw/ieee802-dot1q-preemption.yin \
+	model/802.1/Qcw/ieee802-dot1q-sched.yin \
+	model/ieee802-dot1q-types.yin \
 	model/ietf-interfaces-config.rng \
 	model/ietf-interfaces-gdefs-config.rng \
 	model/ietf-interfaces-schematron.xsl
 
-SRCS = $(TARGET).c \
-	iface_if.c
+SRCS = $(TARGET).c
 
 OBJDIR = .obj
 LOBJS = $(SRCS:%.c=$(OBJDIR)/%.lo)
@@ -50,6 +50,15 @@ $(OBJDIR)/%.lo: %.c
 	@[ -d $$(dirname $@) ] || \
 		(mkdir -p $$(dirname $@))
 	$(LIBTOOL) --mode=compile $(CC) $(CFLAGS) $(CPPFLAGS) -fPIC -shared -c $< -o $@
+
+.PHONY: validate
+validate:
+	lnctool --model model/ietf-interfaces@2014-05-08.yang \
+		--augment-model model/802.1/Qcw/ieee802-dot1q-preemption.yang \
+		--augment-model model/802.1/Qcw/ieee802-dot1q-sched.yang \
+		--augment-model model/ieee802-dot1q-types.yang \
+		--search-path model/ \
+		validation
 
 .PHONY: install
 install: $(MODULE) $(TARGET)-init
@@ -68,12 +77,15 @@ install: $(MODULE) $(TARGET)-init
 			--transapi $(DESTDIR)/$(libdir)/cfginterfaces.so \
 			--datastore $(NETOPEER_DIR)/ietf-interfaces/datastore.xml; \
 		$(NETOPEER_MANAGER) add --name ietf-interfaces \
-			--augment $(NETOPEER_DIR)/ietf-interfaces/ietf-ip.yin \
-			--features ipv4-non-contiguous-netmasks ipv6-privacy-autoconf; \
+			--augment $(NETOPEER_DIR)/ietf-interfaces/ieee802-dot1q-preemption.yin \
+			--features frame-preemption; \
 		$(NETOPEER_MANAGER) add --name ietf-interfaces \
-			--import $(NETOPEER_DIR)/ietf-interfaces/iana-if-type.yin; \
+			--augment $(NETOPEER_DIR)/ietf-interfaces/ieee802-dot1q-sched.yin \
+			--features scheduled-traffic; \
+		$(NETOPEER_MANAGER) add --name ietf-interfaces \
+			--import $(NETOPEER_DIR)/ietf-interfaces/ieee802-dot1q-types.yin; \
 	fi
-	./$(TARGET)-init $(NETOPEER_DIR)/ietf-interfaces/datastore.xml ipv4-non-contiguous-netmasks ipv6-privacy-autoconf
+	./$(TARGET)-init $(NETOPEER_DIR)/ietf-interfaces/datastore.xml
 
 .PHONY: uninstall
 uninstall:
